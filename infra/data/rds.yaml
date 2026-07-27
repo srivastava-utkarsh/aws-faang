@@ -1,0 +1,117 @@
+# infra/data/rds.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow RDS Aurora PostgreSQL Serverless v2.
+  Lives in private subnets — never directly reachable from internet.
+  Only the ECS security group can connect on port 5432.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Master DB password. Use a strong password here.
+      We will move this to Secrets Manager in a later step.
+      NoEcho=true means it will never appear in CloudFormation console logs.
+
+Resources:
+
+  # Subnet group tells RDS which subnets it can place instances in.
+  # Must span at least 2 AZs — Aurora requires this even for single-instance.
+  # We use our private subnets so RDS is never internet-accessible.
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub orderflow-db-subnet-group-${Environment}
+      DBSubnetGroupDescription: Private subnets for OrderFlow RDS
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: orderflow-PrivateSubnetA-${Environment}
+        - !ImportValue
+          Fn::Sub: orderflow-PrivateSubnetB-${Environment}
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # The Aurora cluster — this is the logical grouping.
+  # Individual DB instances join this cluster.
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    # Delete = no final snapshot on stack deletion — teardown finishes faster
+    # and leaves nothing behind to accrue snapshot storage cost. Fine here
+    # since every teardown+redeploy cycle is already a clean slate (SQS/
+    # DynamoDB never retain anything either) — flip to Snapshot before this
+    # ever holds data you'd actually need to recover.
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '15.17'
+      DatabaseName: orderflow
+      MasterUsername: orderflow_admin
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      # Only our ECS tasks can reach this — enforced at network level.
+      VpcSecurityGroupIds:
+        - !ImportValue
+            Fn::Sub: orderflow-RdsSG-${Environment}
+      # Serverless v2 scaling config — applies to db.serverless instance class.
+      # 0.5 ACU = ~1GB RAM. 4 ACU = ~8GB RAM.
+      # Aurora scales between these automatically based on load.
+      # Cost is per ACU-hour, so idle = near zero.
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      # 7 days of automated backups. Point-in-time recovery within that window.
+      BackupRetentionPeriod: 7
+      # Enabled = Aurora creates automated snapshots and can restore
+      # to any second within the retention window.
+      EnableCloudwatchLogsExports:
+        - postgresql  # Ship slow query logs and error logs to CloudWatch
+      # false for dev so you can iterate. MUST be true for prod.
+      DeletionProtection: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # A single writer instance. db.serverless = uses Serverless v2 config above.
+  # In production you'd add a reader instance in the other AZ.
+  DBWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      # PubliclyAccessible: false is the default but we set it explicitly
+      # so it's visible in code review and not accidentally changed.
+      PubliclyAccessible: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  DBClusterEndpoint:
+    Description: Writer endpoint — use this for all app connections
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export:
+      Name: !Sub orderflow-DBEndpoint-${Environment}
+
+  DBPort:
+    Value: !GetAtt DBCluster.Endpoint.Port
+    Export:
+      Name: !Sub orderflow-DBPort-${Environment}
+
+  DBName:
+    Value: orderflow
+    Export:
+      Name: !Sub orderflow-DBName-${Environment}
+
+  DBSubnetGroupName:
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub orderflow-DBSubnetGroup-${Environment}

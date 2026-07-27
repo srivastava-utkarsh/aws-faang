@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM roles for OrderFlow. One role per compute unit — ECS task role,
+  Lambda execution role. Each role has only the permissions it needs.
+  Why: If a container is compromised, the blast radius is limited to
+  the permissions of that one task role.
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  # ECS Task Execution Role — used by ECS AGENT to pull images and write logs.
+  # This is NOT the application role. The agent needs ECR pull + CW logs.
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-ecs-execution-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  # ECS Task Role — used by YOUR APPLICATION CODE inside the container.
+  # This is the role your Spring Boot app uses to call SQS, RDS, DynamoDB.
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-ecs-task-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrderServicePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # SQS — send messages to order queue only
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Sub arn:aws:sqs:*:${AWS::AccountId}:orderflow-*
+              # DynamoDB — read/write idempotency table only
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub arn:aws:dynamodb:*:${AWS::AccountId}:table/orderflow-*
+              # CloudWatch — write logs and metrics
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Lambda Execution Role — for payment and notification Lambdas
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-lambda-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: LambdaServicePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Sub arn:aws:sqs:*:${AWS::AccountId}:orderflow-*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub arn:aws:sns:*:${AWS::AccountId}:orderflow-*
+              - Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: '*'
+
+  # Authorizer Lambda Role — deliberately NOT the same role as
+  # LambdaExecutionRole above. The authorizer only ever verifies a JWT — it
+  # never touches SQS/SNS/DynamoDB/RDS, so it gets no VPC access and no
+  # custom policy at all, just enough to write its own CloudWatch logs.
+  # Sharing LambdaExecutionRole here would mean the authorizer COULD call
+  # SQS/SNS even though it should never need to — a needless expansion of
+  # blast radius for one function.
+  AuthorizerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-authorizer-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+Outputs:
+  EcsTaskExecutionRoleArn:
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+    Export:
+      Name: !Sub orderflow-EcsExecutionRoleArn-${Environment}
+
+  EcsTaskRoleArn:
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub orderflow-EcsTaskRoleArn-${Environment}
+
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub orderflow-LambdaRoleArn-${Environment}
+
+  AuthorizerLambdaRoleArn:
+    Value: !GetAtt AuthorizerLambdaRole.Arn
+    Export:
+      Name: !Sub orderflow-AuthorizerRoleArn-${Environment}

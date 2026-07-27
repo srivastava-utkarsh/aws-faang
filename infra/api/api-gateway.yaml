@@ -1,0 +1,182 @@
+# infra/api/api-gateway.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow public entry point: REST API + Lambda REQUEST authorizer (JWT)
+  in front of the order-service ALB. Client TLS is provided free by API
+  Gateway's own execute-api.amazonaws.com endpoint — no ACM certificate
+  needed (ACM isn't in this project's approved service list).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: >
+      HS256 shared secret for verifying order tokens. Must match whatever
+      signs the JWTs your test client presents. NoEcho hides it from the
+      CloudFormation console/CLI output.
+
+  AuthorizerCodeS3Key:
+    Type: String
+    Default: lambda-authorizer/lambda-authorizer.jar
+    Description: >
+      Key of the shaded authorizer jar inside the orderflow-cfn-artifacts
+      bucket. Upload it with `aws s3 cp` BEFORE deploying this stack —
+      see the deployment guide.
+
+Resources:
+
+  # ── AUTHORIZER LAMBDA ──────────────────────────────────────────────────────
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub orderflow-authorizer-${Environment}
+      Runtime: java21
+      Handler: com.orderflow.authorizer.JwtAuthorizerHandler::handleRequest
+      MemorySize: 512 # JVM cold start is memory-sensitive; 512MB keeps it reasonable
+      Timeout: 10
+      Role: !ImportValue
+        Fn::Sub: orderflow-AuthorizerRoleArn-${Environment}
+      Code:
+        S3Bucket: !Sub orderflow-cfn-artifacts-${AWS::AccountId}
+        S3Key: !Ref AuthorizerCodeS3Key
+      Environment:
+        Variables:
+          JWT_SECRET: !Ref JwtSecret
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/orderflow-authorizer-${Environment}
+      RetentionInDays: 14
+
+  # ── REST API ───────────────────────────────────────────────────────────────
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub orderflow-api-${Environment}
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  Authorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub orderflow-jwt-authorizer-${Environment}
+      RestApiId: !Ref RestApi
+      Type: REQUEST
+      IdentitySource: method.request.header.Authorization
+      AuthorizerUri: !Sub
+        - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations
+        - FnArn: !GetAtt AuthorizerFunction.Arn
+      # Same identity source (same Authorization header value) skips a
+      # second Lambda invocation for 5 minutes — cheaper and faster, at
+      # the cost of a stale-token window if you revoke mid-TTL.
+      AuthorizerResultTtlInSeconds: 300
+
+  # Resource-based policy: lets API Gateway invoke the authorizer at all.
+  # Without this, every call fails with "Lambda invocation failed" — the
+  # Authorizer resource above only points at the function, it doesn't
+  # grant permission to call it.
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/${Authorizer}
+
+  # ── /orders ────────────────────────────────────────────────────────────────
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: orders
+
+  OrdersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      # HTTP_PROXY = pass the request through as-is (method, body, most
+      # headers) with NO request/response mapping templates to maintain —
+      # same "proxy" simplicity as AWS_PROXY for a Lambda, just for an
+      # HTTP backend (the ALB) instead.
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - http://${AlbDns}/orders
+          - AlbDns:
+              Fn::ImportValue: !Sub orderflow-AlbDnsName-${Environment}
+        # HTTP_PROXY skips response mapping automatically, but request-side
+        # header injection still needs an explicit mapping: this is how the
+        # authorizer's verified userId reaches Order Service as a trusted
+        # header, instead of trusting whatever the client puts in the body.
+        RequestParameters:
+          integration.request.header.X-User-Id: context.authorizer.userId
+
+  # ── /orders/{orderId} ─────────────────────────────────────────────────────
+  OrderIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref OrdersResource
+      PathPart: '{orderId}'
+
+  OrderGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref OrderIdResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      RequestParameters:
+        method.request.path.orderId: true
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: GET
+        Uri: !Sub
+          - http://${AlbDns}/orders/{orderId}
+          - AlbDns:
+              Fn::ImportValue: !Sub orderflow-AlbDnsName-${Environment}
+        RequestParameters:
+          integration.request.path.orderId: method.request.path.orderId
+          integration.request.header.X-User-Id: context.authorizer.userId
+
+  # ── DEPLOYMENT + STAGE ─────────────────────────────────────────────────────
+  # NOTE (common CFN gotcha): a Deployment resource is a point-in-time
+  # snapshot. Redeploying this template with method/integration changes but
+  # an unchanged Deployment logical ID will NOT push those changes to the
+  # stage. Rename this logical ID (e.g. add a suffix) whenever methods
+  # change, or use `aws apigateway create-deployment` manually after
+  # `cloudformation deploy`.
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OrdersPostMethod
+      - OrderGetMethod
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref Environment
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+
+Outputs:
+  ApiInvokeUrl:
+    Description: Base URL clients call — e.g. POST {this}/orders
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub orderflow-ApiInvokeUrl-${Environment}

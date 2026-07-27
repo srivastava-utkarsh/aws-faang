@@ -1,0 +1,83 @@
+# infrastructure/compute/ecr.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow ECR repositories. One repo per service.
+  Images are scanned on push for known CVEs.
+  Lifecycle policy keeps last 10 images to prevent storage cost creep.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+
+  OrderServiceRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub orderflow/order-service-${Environment}
+      # Without this, deleting the stack fails outright ("repository ...
+      # cannot be deleted because it still contains images") the moment
+      # a single docker push has happened — which is every teardown after
+      # the first deploy. EmptyOnDelete removes all images first instead.
+      EmptyOnDelete: true
+      # Scan immediately when docker push completes.
+      # Results appear in ECR console and can trigger alerts.
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      # Lifecycle policy: when image count exceeds 10, expire the oldest.
+      # Prevents unbounded storage growth from CI/CD building dozens of images.
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep only last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  InventoryServiceRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub orderflow/inventory-service-${Environment}
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep only last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  OrderServiceRepoUri:
+    Description: Full URI including registry — use in docker push and task definition
+    Value: !GetAtt OrderServiceRepo.RepositoryUri
+    Export:
+      Name: !Sub orderflow-OrderServiceRepoUri-${Environment}
+
+  InventoryServiceRepoUri:
+    Value: !GetAtt InventoryServiceRepo.RepositoryUri
+    Export:
+      Name: !Sub orderflow-InventoryServiceRepoUri-${Environment}

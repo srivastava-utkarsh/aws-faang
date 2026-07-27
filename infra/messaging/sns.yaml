@@ -1,0 +1,139 @@
+# infrastructure/messaging/sns.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow SNS notification topic with SQS fan-out.
+  SNS publishes to SQS queues (not directly to Lambda) so each
+  notification channel has independent retry and DLQ behaviour.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+
+  # The SNS topic that EventBridge publishes OrderConfirmed events to.
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub orderflow-notifications-${Environment}
+      DisplayName: OrderFlow   # Appears in SMS messages as sender name
+
+  # Separate SQS queue per notification channel.
+  # Why not subscribe Lambda directly to SNS?
+  # Because SQS gives you: independent retries, DLQ per channel,
+  # and rate control (Lambda processes at its own pace, no burst).
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: EmailDlq
+    Properties:
+      QueueName: !Sub orderflow-email-queue-${Environment}
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailDlq.Arn
+        maxReceiveCount: 3
+
+  EmailDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub orderflow-email-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+
+  SmsQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: SmsDlq
+    Properties:
+      QueueName: !Sub orderflow-sms-queue-${Environment}
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SmsDlq.Arn
+        maxReceiveCount: 3
+
+  SmsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub orderflow-sms-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+
+  # SNS needs explicit permission to write to each SQS queue.
+  # Without this policy, SNS will get AccessDenied when it tries to publish.
+  # The SourceArn condition ensures only THIS topic can write — not any SNS topic.
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmailQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EmailQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationTopic
+
+  SmsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SmsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SmsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationTopic
+
+  # Wire SNS → SQS subscriptions.
+  # RawMessageDelivery: true means the SQS message body is exactly what
+  # SNS received. false (default) wraps it in an SNS envelope with metadata.
+  # Raw = easier to parse in Lambda, no envelope stripping needed.
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt EmailQueue.Arn
+      RawMessageDelivery: true
+
+  SmsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SmsQueue.Arn
+      RawMessageDelivery: true
+
+Outputs:
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub orderflow-NotificationTopicArn-${Environment}
+
+  EmailQueueUrl:
+    Value: !Ref EmailQueue
+    Export:
+      Name: !Sub orderflow-EmailQueueUrl-${Environment}
+
+  EmailQueueArn:
+    Value: !GetAtt EmailQueue.Arn
+    Export:
+      Name: !Sub orderflow-EmailQueueArn-${Environment}
+
+  SmsQueueUrl:
+    Value: !Ref SmsQueue
+    Export:
+      Name: !Sub orderflow-SmsQueueUrl-${Environment}
+
+  SmsQueueArn:
+    Value: !GetAtt SmsQueue.Arn
+    Export:
+      Name: !Sub orderflow-SmsQueueArn-${Environment}

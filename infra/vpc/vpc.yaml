@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+    OrderFlow VPC — 2 public subnets (ALB), 2 private subnets (ECS/RDS).
+    Why 2 of each: multi-AZ for high availability. If one AZ goes down, traffic
+    fails over to the other. This is non-negotiable for production.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev,prod]
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    # /16 gives us 65,536 IPs — plenty of room to add subnets later
+
+Resources:
+  # ── VPC ──────────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true # Required for RDS hostname resolution
+      EnableDnsHostnames: true    # Required for ECS tasks to resolve endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-vpc-${Environment}
+
+  # ── INTERNET GATEWAY ─────────────────────────────────────────────────────
+  # Why: Public subnets need this to reach the internet (for ALB traffic in)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-igw-${Environment}
+  
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── PUBLIC SUBNETS ────────────────────────────────────────────────────────
+  # Why public: ALB (load balancer) must be in public subnets to receive
+  # internet traffic. ECS tasks themselves stay in private subnets.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24      # 256 IPs, AZ-a
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-public-a-${Environment}
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24      # 256 IPs, AZ-b
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-public-b-${Environment}
+  # ── PRIVATE SUBNETS ───────────────────────────────────────────────────────
+  # Why private: ECS tasks and RDS should NEVER be directly reachable from
+  # the internet. They can only receive traffic from the ALB or other services
+  # inside the VPC. Outbound internet access (ECR pulls, SQS/DynamoDB calls)
+  # goes through the NAT Gateway below.
+  #
+  # NAT was briefly removed here to save the ~$32/month idle cost, but that
+  # breaks the very first ECS task launch: Fargate tasks are ephemeral with
+  # no pre-existing image cache, so the first pull from ECR needs a real
+  # network path (NAT or VPC endpoints) or it fails outright — there's no
+  # "it still works once" fallback. Restored for now; swapping to VPC
+  # Interface/Gateway Endpoints instead of NAT is a legitimate Phase 2 cost
+  # optimization once this environment needs to stay up for longer stretches.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-private-a-${Environment}
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-private-b-${Environment}
+
+  # ── NAT GATEWAY ───────────────────────────────────────────────────────────
+  # Lets private-subnet resources (ECS tasks) make OUTBOUND calls (ECR image
+  # pulls, SQS/DynamoDB SDK calls) without being reachable from the internet
+  # themselves. One-way door: outbound yes, inbound no.
+  #
+  # Cost: ~$32/month if left running continuously — for a short deploy/test/
+  # teardown session this is a few cents. Not worth optimizing away with VPC
+  # Interface/Gateway Endpoints (com.amazonaws.<region>.ecr.api/.ecr.dkr/.sqs
+  # + free Gateway endpoints for .s3/.dynamodb) until this environment needs
+  # to stay up for longer stretches — that's a Phase 2 exercise, not now.
+  # One NAT in PublicSubnetA only — both AZs share it in dev. For prod, add
+  # a second NAT in PublicSubnetB so an AZ outage doesn't take down egress.
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-nat-${Environment}
+
+  # ── ROUTE TABLES ──────────────────────────────────────────────────────────
+  # Public route table: default route → Internet Gateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-public-rt-${Environment}
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private route table: default route → NAT Gateway
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub orderflow-private-rt-${Environment}
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── SECURITY GROUPS ───────────────────────────────────────────────────────
+  # Why separate SGs per tier: least-privilege networking.
+  # The DB security group only allows traffic from the ECS security group —
+  # not from the whole VPC, not from the internet.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTP/HTTPS from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks - only allow traffic from ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - only allow  trafffic from ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+# ── OUTPUTS ────────────────────────────────────────────────────────────────
+# Why Outputs: Other CloudFormation stacks import these values.
+# rds.yaml imports VpcId and PrivateSubnetA/B. ecs-service.yaml imports
+# EcsSecurityGroup. This is how stacks communicate without hardcoding ARNs.
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub orderflow-VpcId-${Environment}
+
+  PublicSubnetA:
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub orderflow-PublicSubnetA-${Environment}
+
+  PublicSubnetB:
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub orderflow-PublicSubnetB-${Environment}
+
+  PrivateSubnetA:
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub orderflow-PrivateSubnetA-${Environment}
+
+  PrivateSubnetB:
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub orderflow-PrivateSubnetB-${Environment}
+
+  AlbSecurityGroup:
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: !Sub orderflow-AlbSG-${Environment}
+
+  EcsSecurityGroup:
+    Value: !Ref EcsSecurityGroup
+    Export:
+      Name: !Sub orderflow-EcsSG-${Environment}
+
+  RdsSecurityGroup:
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub orderflow-RdsSG-${Environment}

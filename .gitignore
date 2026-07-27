@@ -1,0 +1,21 @@
+# Build artifacts (per-module .gitignore files also cover some of this,
+# this catches every module including new ones without their own)
+target/
+*.class
+*.jar
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.factorypath
+
+# Logs
+*.log
+
+# Local env / secrets — never commit real DB passwords or JWT secrets
+.env
+.env.*

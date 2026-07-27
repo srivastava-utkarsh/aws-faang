@@ -1,0 +1,123 @@
+# infrastructure/messaging/eventbridge.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow EventBridge custom event bus.
+  Producers publish events here. Rules route them to consumers.
+  Adding a new consumer = add one rule. Zero producer code changes.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+
+  # Custom event bus. Events from our services go here, NOT the default bus.
+  # Why custom bus? Isolation. Default bus receives all AWS service events.
+  # Using a custom bus means our events never mix with AWS noise.
+  OrderEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub orderflow-order-bus-${Environment}
+
+  # ── RULE 1: OrderConfirmed → SNS → email + SMS ────────────────────────────
+  # Pattern: matches events where source="com.orderflow.order"
+  # AND detail-type="OrderConfirmed".
+  # Producers MUST use these exact values or the rule won't match.
+  NotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub orderflow-confirmed-to-notification-${Environment}
+      Description: Route OrderConfirmed to SNS notification topic
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - com.orderflow.order
+        detail-type:
+          - OrderConfirmed
+      State: ENABLED
+      Targets:
+        - Id: NotificationSnsTarget
+          Arn: !ImportValue
+            Fn::Sub: orderflow-NotificationTopicArn-${Environment}
+
+  # EventBridge needs permission to publish to SNS.
+  # Without this, EventBridge silently drops the event (no error thrown).
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !ImportValue
+          Fn::Sub: orderflow-NotificationTopicArn-${Environment}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !ImportValue
+              Fn::Sub: orderflow-NotificationTopicArn-${Environment}
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt NotificationRule.Arn
+
+  # ── RULE 2: OrderConfirmed → Payment Lambda ───────────────────────────────
+  # NOTE: This rule is DISABLED until the Lambda exists.
+  # We enable it in the compute step after deploying the Lambda.
+  # Disabled rules don't route events but don't cause stack errors either.
+  PaymentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub orderflow-confirmed-to-payment-${Environment}
+      Description: Route OrderConfirmed to payment Lambda (enable after Lambda deploy)
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - com.orderflow.order
+        detail-type:
+          - OrderConfirmed
+      State: DISABLED   # Enable in Step 16 after Lambda is deployed
+      Targets:
+        - Id: PaymentLambdaTarget
+          Arn: !Sub >-
+            arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:orderflow-payment-${Environment}
+
+  # ── RULE 3: All order events → S3 archive Lambda ─────────────────────────
+  # Captures everything: OrderConfirmed, OrderFailed, PaymentCompleted.
+  # Also DISABLED until archiver Lambda is deployed.
+  ArchiveRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub orderflow-all-to-archive-${Environment}
+      Description: Archive every order event to S3 (enable after Lambda deploy)
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - com.orderflow.order
+      State: DISABLED   # Enable in Step 16
+      Targets:
+        - Id: ArchiverLambdaTarget
+          Arn: !Sub >-
+            arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:orderflow-archiver-${Environment}
+
+Outputs:
+  OrderEventBusArn:
+    Value: !GetAtt OrderEventBus.Arn
+    Export:
+      Name: !Sub orderflow-OrderEventBusArn-${Environment}
+
+  OrderEventBusName:
+    Value: !Ref OrderEventBus
+    Export:
+      Name: !Sub orderflow-OrderEventBusName-${Environment}
+
+  PaymentRuleArn:
+    Value: !GetAtt PaymentRule.Arn
+    Export:
+      Name: !Sub orderflow-PaymentRuleArn-${Environment}
+
+  ArchiveRuleArn:
+    Value: !GetAtt ArchiveRule.Arn
+    Export:
+      Name: !Sub orderflow-ArchiveRuleArn-${Environment}

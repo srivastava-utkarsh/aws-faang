@@ -1,0 +1,65 @@
+# infrastructure/data/dynamodb.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow DynamoDB tables.
+  Idempotency table: prevents duplicate order processing.
+  Uses TTL so keys auto-expire — no manual cleanup needed.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+
+  # Idempotency table.
+  # PK = the idempotencyKey sent by the client in the X-Idempotency-Key header.
+  # On first request: PutItem with ConditionExpression — write succeeds.
+  # On duplicate request: PutItem with same key — ConditionExpression fails,
+  #   app returns cached orderId without re-processing.
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub orderflow-idempotency-${Environment}
+
+      # PAY_PER_REQUEST = no capacity planning needed.
+      # You pay per read/write operation. Scales automatically to any throughput.
+      # For dev: much cheaper than provisioned (which charges even when idle).
+      # For prod with predictable load: consider provisioned for cost predictability.
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S  # S = String
+
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH  # Simple primary key, no sort key needed
+
+      # TTL: DynamoDB automatically deletes items whose 'expiresAt' attribute
+      # is a Unix epoch timestamp in the past. Zero extra cost. Zero cleanup code.
+      # When you write an idempotency key, set expiresAt = now() + 86400 (24 hours).
+      # After 24h the key disappears. The same idempotencyKey can be reused after that.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+      # Point-in-time recovery — 35-day recovery window.
+      # Lets you restore the table to any second in the last 35 days.
+      # Cheap insurance against accidental bulk deletes.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+Outputs:
+  IdempotencyTableName:
+    Value: !Ref IdempotencyTable
+    Export:
+      Name: !Sub orderflow-IdempotencyTable-${Environment}
+
+  IdempotencyTableArn:
+    Value: !GetAtt IdempotencyTable.Arn
+    Export:
+      Name: !Sub orderflow-IdempotencyTableArn-${Environment}

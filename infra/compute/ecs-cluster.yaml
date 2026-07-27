@@ -1,0 +1,53 @@
+# infrastructure/compute/ecs-cluster.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow ECS cluster with Fargate capacity providers.
+  FARGATE_SPOT used for dev — up to 70% cheaper than on-demand Fargate.
+  Container Insights enabled for per-task CloudWatch metrics.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub orderflow-cluster-${Environment}
+
+      # Container Insights: publishes CloudWatch metrics per task and per service.
+      # Metrics: CPU utilisation, memory utilisation, network I/O, task count.
+      # Small cost (~$0.50/GB ingested) but essential for debugging.
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+      # FARGATE = regular on-demand. FARGATE_SPOT = spare capacity, up to 70% off.
+      # Spot tasks can be interrupted with 2-min notice. Fine for dev.
+      # For prod: mix of Fargate (base) + Fargate_Spot (burst) for cost + reliability.
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+
+      # Dev default: use Spot. Set Base=0 so minimum tasks can be Spot too.
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+          Base: 0
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt EcsCluster.Arn
+    Export:
+      Name: !Sub orderflow-ClusterArn-${Environment}
+
+  ClusterName:
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub orderflow-ClusterName-${Environment}

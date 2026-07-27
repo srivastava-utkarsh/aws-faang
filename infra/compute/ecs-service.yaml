@@ -1,0 +1,203 @@
+# infra/compute/ecs-service.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow order-service on ECS Fargate: internet-facing ALB in public
+  subnets, task definition (execution role + task role, image from ECR),
+  and a service that keeps 2 tasks running behind the ALB target group.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ImageTag:
+    Type: String
+    Description: Docker image tag to deploy (git sha or "latest")
+    Default: latest
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    Description: Same value passed to rds.yaml — injected into the task as DB_PASSWORD.
+
+Resources:
+
+  # ── LOAD BALANCER ──────────────────────────────────────────────────────────
+  # Public subnets, internet-facing: this is the ONLY way into the order
+  # service. ECS tasks themselves stay in private subnets and are never
+  # reachable except via this ALB (enforced by EcsSecurityGroup in vpc.yaml).
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub orderflow-alb-${Environment}
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !ImportValue
+            Fn::Sub: orderflow-AlbSG-${Environment}
+      Subnets:
+        - !ImportValue
+            Fn::Sub: orderflow-PublicSubnetA-${Environment}
+        - !ImportValue
+            Fn::Sub: orderflow-PublicSubnetB-${Environment}
+
+  # Health check hits Spring Boot Actuator — a task only receives traffic
+  # once /actuator/health returns 200, so a slow-starting JVM never gets
+  # requests routed to it before it's ready.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub orderflow-tg-${Environment}
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip # required for Fargate — tasks don't have a fixed EC2 instance to attach to
+      VpcId: !ImportValue
+        Fn::Sub: orderflow-VpcId-${Environment}
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  # No HTTPS/ACM here on purpose: ACM isn't in this project's approved
+  # 15-service list, so this listener is plain HTTP. Client-facing TLS is
+  # provided for free by API Gateway's default execute-api endpoint
+  # (see api-gateway.yaml) — this ALB only ever talks to API Gateway
+  # inside AWS, not directly to the internet's browsers/apps.
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── TASK DEFINITION ────────────────────────────────────────────────────────
+  # Two DIFFERENT roles, two different jobs:
+  #  - ExecutionRoleArn: the ECS AGENT uses this to pull the image from ECR
+  #    and create the CloudWatch log stream. Your code never touches this role.
+  #  - TaskRoleArn: YOUR APPLICATION CODE (Spring Boot's AWS SDK clients) uses
+  #    this at runtime to call SQS/DynamoDB. This is what OrderQueuePublisher
+  #    and IdempotencyService actually run as.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub orderflow-order-service-${Environment}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc # required for Fargate — every task gets its own ENI
+      Cpu: '512'    # 0.5 vCPU
+      Memory: '1024' # 1 GB — matches a small JVM heap comfortably
+      # Fargate defaults to X86_64. The order-service image is built with
+      # plain `docker build` (no --platform flag) on whatever machine runs
+      # deploy.sh; on Apple Silicon that produces an ARM64 image, which
+      # fails with "exec format error" on an X86_64 task — the container
+      # never even starts. Declaring ARM64 here matches Graviton-based
+      # Fargate to that image: no QEMU cross-build needed locally, and
+      # Graviton is ~20% cheaper than equivalent X86_64 Fargate anyway.
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: orderflow-EcsExecutionRoleArn-${Environment}
+      TaskRoleArn: !ImportValue
+        Fn::Sub: orderflow-EcsTaskRoleArn-${Environment}
+      ContainerDefinitions:
+        - Name: order-service
+          Image: !Sub
+            - '${RepoUri}:${ImageTag}'
+            - RepoUri:
+                Fn::ImportValue: !Sub orderflow-OrderServiceRepoUri-${Environment}
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_URL
+              Value: !Sub
+                - jdbc:postgresql://${Endpoint}:${Port}/orderflow
+                - Endpoint:
+                    Fn::ImportValue: !Sub orderflow-DBEndpoint-${Environment}
+                  Port:
+                    Fn::ImportValue: !Sub orderflow-DBPort-${Environment}
+            - Name: DB_USERNAME
+              Value: orderflow_admin
+            # Plaintext task-definition env var, not Secrets Manager: Secrets
+            # Manager isn't in the approved service list for this project.
+            # Known trade-off — anyone with ecs:DescribeTaskDefinition can
+            # read this. Acceptable for a dev/learning account; flip to
+            # Secrets Manager or SSM Parameter Store before this holds
+            # anything real.
+            - Name: DB_PASSWORD
+              Value: !Ref DBMasterPassword
+            - Name: ORDER_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: orderflow-OrderQueueUrl-${Environment}
+            - Name: IDEMPOTENCY_TABLE
+              Value: !ImportValue
+                Fn::Sub: orderflow-IdempotencyTable-${Environment}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: order-service
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/orderflow-order-service-${Environment}
+      RetentionInDays: 14
+
+  # ── SERVICE ────────────────────────────────────────────────────────────────
+  # Keeps DesiredCount tasks running, registers/deregisters them with the
+  # target group as they start/stop, and drives rolling deploys when a new
+  # task definition revision is pushed.
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub orderflow-order-service-${Environment}
+      Cluster: !ImportValue
+        Fn::Sub: orderflow-ClusterName-${Environment}
+      TaskDefinition: !Ref TaskDefinition
+      # 1, not 2: no redundancy needed for a solo dev/learning environment,
+      # and it roughly halves Fargate compute cost on top of the Spot
+      # discount below. Bump to 2 (or more) temporarily for a specific test
+      # if you want to see rolling-deployment/target-group-draining behavior.
+      DesiredCount: 1
+      # LaunchType: FARGATE would bypass ecs-cluster.yaml's FARGATE_SPOT
+      # capacity provider entirely and run on full-price on-demand compute.
+      # Explicit CapacityProviderStrategy here (rather than relying on the
+      # cluster's DefaultCapacityProviderStrategy) makes the cost choice
+      # visible at the service that actually incurs it — up to 70% cheaper
+      # than on-demand. Spot tasks can be reclaimed with a 2-min warning,
+      # acceptable for dev; mix in on-demand FARGATE as a Base for prod.
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED # private subnets — outbound goes via NAT, no public IP needed
+          Subnets:
+            - !ImportValue
+                Fn::Sub: orderflow-PrivateSubnetA-${Environment}
+            - !ImportValue
+                Fn::Sub: orderflow-PrivateSubnetB-${Environment}
+          SecurityGroups:
+            - !ImportValue
+                Fn::Sub: orderflow-EcsSG-${Environment}
+      LoadBalancers:
+        - ContainerName: order-service
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AlbDnsName:
+    Description: Public ALB DNS — used by api-gateway.yaml's HTTP_PROXY integration
+    Value: !GetAtt Alb.DNSName
+    Export:
+      Name: !Sub orderflow-AlbDnsName-${Environment}
+
+  ClusterServiceName:
+    Value: !GetAtt EcsService.Name
+    Export:
+      Name: !Sub orderflow-EcsServiceName-${Environment}

@@ -1,0 +1,72 @@
+# infrastructure/messaging/sqs.yaml
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  OrderFlow SQS queues.
+  Main queue: receives new orders from order-service.
+  DLQ: receives messages that failed 3 consecutive processing attempts.
+  CloudFormation creates DLQ first because main queue references its ARN.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  # Dead Letter Queue — defined FIRST because OrderQueue references its ARN.
+  # Messages land here automatically after maxReceiveCount failed attempts.
+  # 14-day retention gives on-call engineers time to investigate.
+  OrderDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub orderflow-order-dlq-${Environment}
+      # 14 days = 1,209,600 seconds
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Main order queue.
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    # DependsOn ensures the DLQ is fully created before OrderQueue attempts
+    # to reference its ARN in the RedrivePolicy below.
+    DependsOn: OrderDeadLetterQueue
+    Properties:
+      QueueName: !Sub orderflow-order-queue-${Environment}
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 86400
+
+      # RedrivePolicy takes a native map — CloudFormation serializes it to
+      # the JSON the SQS API expects. Hand-building it as a string via
+      # Fn::Join is unnecessary and breaks Fn::GetAtt resolution here.
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  OrderQueueUrl:
+    Description: Full URL — inject as SQS_ORDER_QUEUE_URL env var in ECS task
+    Value: !Ref OrderQueue
+    Export:
+      Name: !Sub orderflow-OrderQueueUrl-${Environment}
+
+  OrderQueueArn:
+    Description: ARN — needed by Lambda event source mapping
+    Value: !GetAtt OrderQueue.Arn
+    Export:
+      Name: !Sub orderflow-OrderQueueArn-${Environment}
+
+  OrderDlqArn:
+    Value: !GetAtt OrderDeadLetterQueue.Arn
+    Export:
+      Name: !Sub orderflow-OrderDlqArn-${Environment}
+
+  OrderDlqUrl:
+    Description: URL — needed by CloudWatch alarm and redrive operations
+    Value: !Ref OrderDeadLetterQueue
+    Export:
+      Name: !Sub orderflow-OrderDlqUrl-${Environment}
