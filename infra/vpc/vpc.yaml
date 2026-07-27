@@ -215,16 +215,79 @@ Resources:
           ToPort: 8080
           SourceSecurityGroupId: !Ref AlbSecurityGroup
 
+  # ── PHASE 2 SECURITY GROUPS ───────────────────────────────────────────────
+  # The call chain being secured here is:
+  #   order-processor Lambda → internal ALB → inventory-service tasks
+  #   payment Lambda → RDS (direct JDBC)
+  # Each hop is its own SG referencing the previous one, so no tier can be
+  # reached by anything except the tier directly in front of it.
+  #
+  # None of these declare SecurityGroupEgress, so CloudFormation gives each
+  # the default allow-all-outbound rule. That is what lets the VPC-attached
+  # Lambdas reach EventBridge/SQS public endpoints via the NAT Gateway.
+
+  # Attached to BOTH Phase 2 Lambdas' ENIs (order-processor and payment).
+  # Defined before the SGs that reference it — CloudFormation resolves the
+  # dependency from the !Ref, but keeping the file order matching the call
+  # order makes the chain readable top-to-bottom.
+  LambdaVpcSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC-attached Lambdas (order-processor, payment) - no inbound
+      VpcId: !Ref VPC
+      # No ingress at all: nothing ever initiates a connection TO a Lambda.
+      # Lambda is always the client here (calls the ALB, calls RDS).
+
+  # Internal ALB in front of inventory-service. Scheme=internal in
+  # inventory-service.yaml means it gets private IPs only and is not
+  # routable from the internet regardless of this SG.
+  InventoryAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB for inventory-service - only from Lambdas
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LambdaVpcSecurityGroup
+
+  # inventory-service Fargate tasks. Only the internal ALB can reach them —
+  # not the Lambdas directly, not order-service, not anything else.
+  InventorySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: inventory-service tasks - only allow traffic from internal ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref InventoryAlbSecurityGroup
+
   RdsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: RDS - only allow  trafffic from ECS tasks
       VpcId: !Ref VPC
       SecurityGroupIngress:
+        # order-service tasks (Phase 1)
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
           SourceSecurityGroupId: !Ref EcsSecurityGroup
+        # inventory-service tasks (Phase 2) — reserves stock in the
+        # `inventory` schema of the same cluster
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref InventorySecurityGroup
+        # payment Lambda (Phase 2) — connects directly over JDBC to flip
+        # order status to PAID/PAYMENT_FAILED
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaVpcSecurityGroup
 
 # ── OUTPUTS ────────────────────────────────────────────────────────────────
 # Why Outputs: Other CloudFormation stacks import these values.
@@ -271,3 +334,18 @@ Outputs:
     Value: !Ref RdsSecurityGroup
     Export:
       Name: !Sub orderflow-RdsSG-${Environment}
+
+  LambdaVpcSecurityGroup:
+    Value: !Ref LambdaVpcSecurityGroup
+    Export:
+      Name: !Sub orderflow-LambdaVpcSG-${Environment}
+
+  InventoryAlbSecurityGroup:
+    Value: !Ref InventoryAlbSecurityGroup
+    Export:
+      Name: !Sub orderflow-InventoryAlbSG-${Environment}
+
+  InventorySecurityGroup:
+    Value: !Ref InventorySecurityGroup
+    Export:
+      Name: !Sub orderflow-InventorySG-${Environment}

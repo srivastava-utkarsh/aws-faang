@@ -63,21 +63,27 @@ Resources:
                 aws:SourceArn: !GetAtt NotificationRule.Arn
 
   # ── RULE 2: OrderConfirmed → Payment Lambda ───────────────────────────────
-  # NOTE: This rule is DISABLED until the Lambda exists.
-  # We enable it in the compute step after deploying the Lambda.
-  # Disabled rules don't route events but don't cause stack errors either.
+  # ENABLED as of Phase 2 — the payment Lambda now exists (deployed by
+  # infra/compute/lambda-payment.yaml, which also grants EventBridge
+  # permission to invoke it).
+  #
+  # Ordering note: this stack deploys BEFORE lambda-payment.yaml, so between
+  # those two steps the rule is enabled but its target doesn't exist yet.
+  # EventBridge simply fails delivery for any event in that window — harmless
+  # here because no orders flow mid-deploy. The alternative (deploy, then flip
+  # the rule in a second pass) adds a step for no real benefit in a dev env.
   PaymentRule:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub orderflow-confirmed-to-payment-${Environment}
-      Description: Route OrderConfirmed to payment Lambda (enable after Lambda deploy)
+      Description: Route OrderConfirmed to payment Lambda
       EventBusName: !Ref OrderEventBus
       EventPattern:
         source:
           - com.orderflow.order
         detail-type:
           - OrderConfirmed
-      State: DISABLED   # Enable in Step 16 after Lambda is deployed
+      State: ENABLED
       Targets:
         - Id: PaymentLambdaTarget
           Arn: !Sub >-

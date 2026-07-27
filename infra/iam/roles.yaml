@@ -65,7 +65,14 @@ Resources:
                   - cloudwatch:PutMetricData
                 Resource: '*'
 
-  # Lambda Execution Role — for payment and notification Lambdas
+  # Lambda Execution Role — Phase 3 notification Lambdas (email/SMS consumers
+  # of the SNS → SQS fan-out). Kept for those; the Phase 2 Lambdas each get
+  # their own narrower role below instead of sharing this one.
+  #
+  # Removed in Phase 2: rds-data:ExecuteStatement on "*". That permission is
+  # for the RDS Data API — a separate HTTP-based query feature that is NOT
+  # enabled on this Aurora cluster and is NOT what a JDBC connection uses.
+  # It granted nothing useful and widened the role for no reason.
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -94,11 +101,96 @@ Resources:
                 Action:
                   - sns:Publish
                 Resource: !Sub arn:aws:sns:*:${AWS::AccountId}:orderflow-*
+
+  # ── PHASE 2 ROLES ─────────────────────────────────────────────────────────
+  # One role per function. The alternative — one shared "lambda role" — means
+  # every function can do everything any function needs, so a bug or
+  # compromise in the cheapest function reaches the most sensitive resource.
+
+  # order-processor: reads the order queue, calls inventory-service over the
+  # internal ALB (plain network access, no IAM action), publishes domain
+  # events to the custom bus. It never touches RDS or DynamoDB.
+  OrderProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-order-processor-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # VPC access = permission to create/attach the ENI it needs to reach
+      # the internal ALB. This managed policy also covers CloudWatch Logs.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: OrderProcessorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The SQS event source mapping polls on the function's behalf
+              # using exactly these three actions.
               - Effect: Allow
                 Action:
-                  - rds-data:ExecuteStatement
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:orderflow-order-queue-${Environment}
+              # Publish OrderConfirmed / OrderFailed. Nothing in Phase 1 had
+              # this permission — the bus existed but no principal could
+              # write to it.
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/orderflow-order-bus-${Environment}
+
+  # payment: triggered by EventBridge, connects to Aurora over JDBC.
+  # JDBC is a raw TCP connection authenticated by DB username/password —
+  # there is no IAM action for "run a SQL statement", so this role needs
+  # NO custom policy at all. Reachability is granted at the network layer
+  # (LambdaVpcSecurityGroup → RdsSecurityGroup on 5432), not by IAM.
+  # This is a genuinely useful distinction to understand: network reachability
+  # and IAM authorization are two independent gates.
+  PaymentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-payment-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  # inventory-service task role. Like order-service's, this is what the
+  # application code runs as — but inventory-service only talks to RDS
+  # (JDBC, no IAM action needed), so it gets logs/metrics and nothing else.
+  # No SQS, no DynamoDB, no EventBridge.
+  InventoryTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub orderflow-inventory-task-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InventoryServicePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudwatch:PutMetricData
                 Resource: '*'
 
   # Authorizer Lambda Role — deliberately NOT the same role as
@@ -142,3 +234,18 @@ Outputs:
     Value: !GetAtt AuthorizerLambdaRole.Arn
     Export:
       Name: !Sub orderflow-AuthorizerRoleArn-${Environment}
+
+  OrderProcessorLambdaRoleArn:
+    Value: !GetAtt OrderProcessorLambdaRole.Arn
+    Export:
+      Name: !Sub orderflow-OrderProcessorRoleArn-${Environment}
+
+  PaymentLambdaRoleArn:
+    Value: !GetAtt PaymentLambdaRole.Arn
+    Export:
+      Name: !Sub orderflow-PaymentRoleArn-${Environment}
+
+  InventoryTaskRoleArn:
+    Value: !GetAtt InventoryTaskRole.Arn
+    Export:
+      Name: !Sub orderflow-InventoryTaskRoleArn-${Environment}

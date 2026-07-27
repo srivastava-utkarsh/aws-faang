@@ -57,10 +57,10 @@ section near the end of this file) and not yet built.
 
 | Phase | Scope |
 |---|---|
-| 1 | Foundation infra + order-service + **Lambda JWT authorizer + API Gateway** (all done) |
-| 2 | inventory-service + payment Lambda + order-processor Lambda (SQS consumer) |
+| 1 | Foundation infra + order-service + Lambda JWT authorizer + API Gateway — **deployed & verified** |
+| 2 | inventory-service + order-processor Lambda (SQS consumer) + payment Lambda — **built, ready to deploy** |
 | 3 | SNS notification Lambda + S3 archiver Lambda + DLQ redrive Lambda + `cloudwatch.yaml` |
-| 4 | EKS migration option + `master.yaml` root stack + load test |
+| 4 | EKS migration option + `master.yaml` root stack + load test + **architecture dashboard** (infographic view of which services connect to what, where data is stored, how it's read — requested, deferred to here) |
 
 ## Immediate step — done
 
@@ -838,6 +838,69 @@ none of this blocks proving the payment path works.
 
 ---
 
-Ready to start building — say the word and I'll begin with the VPC/IAM
-changes (foundation for everything else this phase), then inventory-service,
-then the two Lambdas, in that order.
+## Phase 2 — BUILT (not yet deployed)
+
+Everything below compiles and its tests pass locally; all templates pass
+`aws cloudformation validate-template`, and every `ImportValue` was
+cross-checked against a matching export.
+
+### New services
+
+| Module | Tests | Notes |
+|---|---|---|
+| `services/inventory-service` | 5 | Spring Boot / Fargate. Owns the `inventory` schema — **its own** `flyway_schema_history`, so it migrates the shared Aurora cluster independently of order-service's `public` schema. `POST /inventory/reserve`. |
+| `services/order-processor-lambda` | 4 | Plain Java, SQS-triggered. Reserves stock, publishes `OrderConfirmed`/`OrderFailed`. |
+| `services/payment-lambda` | 6 | Plain Java, EventBridge-triggered. JDBC to Aurora. No AWS SDK dependency at all. |
+
+### New infra
+
+- `infra/compute/inventory-service.yaml` — **internal** ALB (private IPs only, no internet route) + Fargate service
+- `infra/compute/lambda-order-processor.yaml` — function + SQS event source mapping (`BatchSize: 10`, `ReportBatchItemFailures`)
+- `infra/compute/lambda-payment.yaml` — function + the `AWS::Lambda::Permission` EventBridge needs to invoke it
+- `vpc.yaml` — 3 new SGs forming the chain `Lambda → internal ALB → inventory tasks`, plus RDS ingress from the Lambda and inventory SGs
+- `roles.yaml` — `OrderProcessorLambdaRole`, `PaymentLambdaRole`, `InventoryTaskRole`
+- `eventbridge.yaml` — `PaymentRule` flipped `DISABLED` → `ENABLED`
+- `deploy.sh` steps 15–17, `teardown.sh` updated to delete the new stacks first
+
+### Three correctness decisions worth remembering
+
+1. **Business rejection vs transient failure.** Out-of-stock returns 409 and
+   the processor publishes `OrderFailed` and *deletes the message*. A 5xx or
+   timeout throws, so the message is reported as a batch item failure and
+   SQS retries it. Getting this backwards means real out-of-stock orders get
+   retried 3× and land in the DLQ looking like an outage.
+2. **Idempotency at every async hop.** SQS is at-least-once and EventBridge
+   retries async invocations, so both consumers assume duplicate delivery:
+   inventory-service keys on a `stock_reservations` row, and the payment
+   Lambda uses a conditional `UPDATE ... WHERE status = 'PENDING'` (0 rows
+   updated = already handled, skip).
+3. **Network reachability ≠ IAM authorization.** `PaymentLambdaRole` has no
+   custom policy whatsoever, because "run a SQL statement" isn't an IAM
+   action — JDBC access is granted purely by the SG chain. Meanwhile the
+   Phase 1 role's `rds-data:ExecuteStatement` was removed: that's the RDS
+   Data API, which isn't enabled on this cluster and was granting nothing.
+
+### Fixed along the way
+
+- `order-service/pom.xml` and `inventory-service/pom.xml` now declare Lombok
+  as an explicit `annotationProcessorPaths` entry. JDK 23+ stopped running
+  classpath annotation processors implicitly, so a local `mvn compile` on a
+  modern JDK failed with `cannot find symbol: getId()` even though the
+  Docker build (JDK 21) succeeded.
+
+### Deploying it
+
+Same one command as Phase 1 — it now runs 18 steps instead of 15:
+
+```bash
+export DB_MASTER_PASSWORD="..." JWT_SECRET="..."
+./scripts/deploy.sh
+```
+
+### What "done" looks like for Phase 2
+
+Create an order, wait ~5s, `GET /orders/{id}` — status is **PAID**, not the
+`PENDING` it was created as. The script prints commands for the two failure
+paths too: an order over 10000 total → `PAYMENT_FAILED`; ordering more than
+the seeded stock of `prod-003` → stays `PENDING` with an `OrderFailed` event
+and no payment attempted.

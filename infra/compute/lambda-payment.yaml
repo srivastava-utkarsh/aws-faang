@@ -1,0 +1,94 @@
+# infra/compute/lambda-payment.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow payment Lambda — EventBridge target for OrderConfirmed.
+  Simulates a charge, then flips the order to PAID / PAYMENT_FAILED in
+  Aurora over a direct JDBC connection.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  CodeS3Key:
+    Type: String
+    Default: payment-lambda/payment-lambda.jar
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+  PaymentDeclineAbove:
+    Type: String
+    Default: '10000'
+    Description: >
+      Orders with a totalAmount above this are declined. Deterministic on
+      purpose — it makes the PAYMENT_FAILED path reproducible on demand
+      instead of random.
+
+Resources:
+
+  PaymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub orderflow-payment-${Environment}
+      Runtime: java21
+      Handler: com.orderflow.payment.PaymentHandler::handleRequest
+      MemorySize: 512
+      Timeout: 30
+      Role: !ImportValue
+        Fn::Sub: orderflow-PaymentRoleArn-${Environment}
+      Code:
+        S3Bucket: !Sub orderflow-cfn-artifacts-${AWS::AccountId}
+        S3Key: !Ref CodeS3Key
+      # Aurora lives in private subnets, so this function must be inside the
+      # VPC to open a JDBC socket to it. Reachability is then granted at the
+      # network layer: LambdaVpcSG → RdsSG on 5432 (see vpc.yaml). There is
+      # no IAM action for "run SQL" — that's why this function's role has no
+      # custom policy at all.
+      VpcConfig:
+        SecurityGroupIds:
+          - !ImportValue
+              Fn::Sub: orderflow-LambdaVpcSG-${Environment}
+        SubnetIds:
+          - !ImportValue
+              Fn::Sub: orderflow-PrivateSubnetA-${Environment}
+          - !ImportValue
+              Fn::Sub: orderflow-PrivateSubnetB-${Environment}
+      Environment:
+        Variables:
+          DB_URL: !Sub
+            - jdbc:postgresql://${Endpoint}:${Port}/orderflow
+            - Endpoint:
+                Fn::ImportValue: !Sub orderflow-DBEndpoint-${Environment}
+              Port:
+                Fn::ImportValue: !Sub orderflow-DBPort-${Environment}
+          DB_USERNAME: orderflow_admin
+          DB_PASSWORD: !Ref DBMasterPassword
+          PAYMENT_DECLINE_ABOVE: !Ref PaymentDeclineAbove
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/orderflow-payment-${Environment}
+      RetentionInDays: 14
+
+  # EventBridge can only invoke this function if the function's own
+  # resource-based policy allows it. PaymentRule in eventbridge.yaml names
+  # this function as a target, but naming a target grants nothing — without
+  # this permission every matched event fails to deliver, silently.
+  #
+  # SourceArn is constructed rather than imported so this stack does not
+  # depend on the eventbridge stack's outputs, which keeps the deploy order
+  # flexible. The format is fixed: rule/<bus-name>/<rule-name> for a rule
+  # on a custom bus.
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PaymentFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/orderflow-order-bus-${Environment}/orderflow-confirmed-to-payment-${Environment}
+
+Outputs:
+  PaymentFunctionArn:
+    Value: !GetAtt PaymentFunction.Arn
+    Export:
+      Name: !Sub orderflow-PaymentFunctionArn-${Environment}

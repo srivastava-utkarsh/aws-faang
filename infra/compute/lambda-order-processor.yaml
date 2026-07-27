@@ -1,0 +1,88 @@
+# infra/compute/lambda-order-processor.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow order-processor Lambda — the SQS consumer that finally drains
+  the order queue. Reserves stock via inventory-service, then publishes
+  OrderConfirmed / OrderFailed to the EventBridge bus.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  CodeS3Key:
+    Type: String
+    Default: order-processor-lambda/order-processor-lambda.jar
+
+Resources:
+
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub orderflow-order-processor-${Environment}
+      Runtime: java21
+      Handler: com.orderflow.processor.OrderProcessorHandler::handleRequest
+      MemorySize: 512
+      # MUST stay below the order queue's VisibilityTimeout (30s in sqs.yaml).
+      # If this exceeded it, SQS would hand the same message to a second
+      # invocation while the first was still running — duplicate processing.
+      Timeout: 25
+      Role: !ImportValue
+        Fn::Sub: orderflow-OrderProcessorRoleArn-${Environment}
+      Code:
+        S3Bucket: !Sub orderflow-cfn-artifacts-${AWS::AccountId}
+        S3Key: !Ref CodeS3Key
+      # VPC attachment is required to reach the INTERNAL ALB — an internal
+      # ALB has private IPs only, so a non-VPC Lambda simply cannot route to
+      # it. This is also why the role needs AWSLambdaVPCAccessExecutionRole
+      # (permission to create the ENI).
+      VpcConfig:
+        SecurityGroupIds:
+          - !ImportValue
+              Fn::Sub: orderflow-LambdaVpcSG-${Environment}
+        SubnetIds:
+          - !ImportValue
+              Fn::Sub: orderflow-PrivateSubnetA-${Environment}
+          - !ImportValue
+              Fn::Sub: orderflow-PrivateSubnetB-${Environment}
+      Environment:
+        Variables:
+          INVENTORY_SERVICE_URL: !Sub
+            - http://${AlbDns}
+            - AlbDns:
+                Fn::ImportValue: !Sub orderflow-InventoryAlbDnsName-${Environment}
+          EVENT_BUS_NAME: !ImportValue
+            Fn::Sub: orderflow-OrderEventBusName-${Environment}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/orderflow-order-processor-${Environment}
+      RetentionInDays: 14
+
+  # ── SQS TRIGGER ────────────────────────────────────────────────────────────
+  # An event source mapping is a poller AWS runs on your behalf: it long-polls
+  # the queue using the FUNCTION'S role permissions and invokes the function
+  # with a batch. Note this is pull-based — SQS never "pushes" to Lambda.
+  OrderQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !ImportValue
+        Fn::Sub: orderflow-OrderQueueArn-${Environment}
+      FunctionName: !GetAtt OrderProcessorFunction.Arn
+      # Up to 10 messages per invocation. Combined with the response type
+      # below, a batch is efficient without making one poison message
+      # re-deliver its nine healthy neighbours.
+      BatchSize: 10
+      # Without this, returning batch item failures from the handler is
+      # ignored: ANY exception fails the WHOLE batch and all 10 messages are
+      # redelivered. The handler already returns an SQSBatchResponse, but it
+      # only takes effect because of this setting.
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      Enabled: true
+
+Outputs:
+  OrderProcessorFunctionArn:
+    Value: !GetAtt OrderProcessorFunction.Arn
+    Export:
+      Name: !Sub orderflow-OrderProcessorArn-${Environment}

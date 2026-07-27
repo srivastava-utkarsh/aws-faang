@@ -182,35 +182,47 @@ next_step "Build the Lambda authorizer JAR"
 # We upload the JAR to S3 so CloudFormation can reference it when creating
 # the Lambda function resource in api-gateway.yaml.
 
-section "STEP 2 — Building Lambda authorizer JAR"
+section "STEP 2 — Building Lambda JARs"
 
-AUTHORIZER_DIR="$PROJECT_ROOT/services/lambda-authorizer"
-info "Building in $AUTHORIZER_DIR ..."
+# Builds one Lambda module and uploads its shaded JAR to the artifacts
+# bucket. The S3 key must match the CodeS3Key default in that Lambda's
+# CloudFormation template.
+#
+# Usage: build_and_upload_lambda <module-dir-name>
+build_and_upload_lambda() {
+  local MODULE=$1
+  local MODULE_DIR="$PROJECT_ROOT/services/$MODULE"
 
-# -DskipTests: we're not running tests in deploy — run them separately in CI.
-# -B (batch mode): suppresses the interactive download progress bars that
-#   make log files unreadable.
-cd "$AUTHORIZER_DIR"
-mvn package -DskipTests -B
+  info "Building $MODULE ..."
+  # -DskipTests: tests run separately (mvn test per module), not during deploy.
+  # -B (batch mode): suppresses download progress bars that make logs unreadable.
+  cd "$MODULE_DIR"
+  mvn package -DskipTests -B -q
 
-# The shade plugin produces a single fat JAR. Find it regardless of version.
-AUTHORIZER_JAR=$(ls target/lambda-authorizer*.jar | grep -v 'original' | head -1)
-if [ ! -f "$AUTHORIZER_JAR" ]; then
-  fail "Authorizer JAR not found in $AUTHORIZER_DIR/target/ — did mvn package succeed?"
-  exit 1
-fi
-ok "Built JAR: $AUTHORIZER_JAR ($(du -h "$AUTHORIZER_JAR" | cut -f1))"
+  # The shade plugin writes <finalName>.jar plus an "original-*.jar" — take
+  # the shaded one.
+  local JAR
+  JAR=$(ls target/${MODULE}*.jar | grep -v 'original' | head -1)
+  if [ ! -f "$JAR" ]; then
+    fail "$MODULE JAR not found in $MODULE_DIR/target/ — did mvn package succeed?"
+    exit 1
+  fi
 
-# Upload to S3 so api-gateway.yaml can reference it as AuthorizerCodeS3Key.
-# The S3 key must match the AuthorizerCodeS3Key default in api-gateway.yaml.
-S3_JAR_KEY="lambda-authorizer/lambda-authorizer.jar"
-info "Uploading JAR to s3://$ARTIFACTS_BUCKET/$S3_JAR_KEY ..."
-aws s3 cp "$AUTHORIZER_JAR" "s3://$ARTIFACTS_BUCKET/$S3_JAR_KEY" \
-  --profile "$PROFILE" \
-  --region "$REGION"
-ok "Authorizer JAR uploaded to S3"
+  local S3_KEY="${MODULE}/${MODULE}.jar"
+  info "Uploading to s3://$ARTIFACTS_BUCKET/$S3_KEY ($(du -h "$JAR" | cut -f1))"
+  aws s3 cp "$JAR" "s3://$ARTIFACTS_BUCKET/$S3_KEY" \
+    --profile "$PROFILE" \
+    --region "$REGION" \
+    --only-show-errors
+  ok "$MODULE uploaded"
 
-cd "$PROJECT_ROOT"
+  cd "$PROJECT_ROOT"
+}
+
+build_and_upload_lambda "lambda-authorizer"        # Phase 1 — API Gateway JWT authorizer
+build_and_upload_lambda "order-processor-lambda"   # Phase 2 — SQS consumer
+build_and_upload_lambda "payment-lambda"           # Phase 2 — EventBridge target
+
 next_step "Deploy CloudFormation infra stacks (VPC, IAM, RDS, DynamoDB, SQS, SNS, EventBridge, ECR, ECS Cluster)"
 
 # ── CFN HELPER FUNCTION ───────────────────────────────────────────────────────
@@ -379,9 +391,9 @@ next_step "ECR repositories (Docker image registries)"
 section "STEP 10 — ECR repositories"
 deploy_stack "orderflow-ecr-$ENV" "infra/compute/ecr.yaml"
 
-# Grab the ECR repo URI from the stack output so we can use it for docker push.
-# This avoids hardcoding the account ID and region in multiple places.
-info "Fetching ECR repo URI from stack output..."
+# Grab the ECR repo URIs from the stack outputs so we can use them for docker
+# push. This avoids hardcoding the account ID and region in multiple places.
+info "Fetching ECR repo URIs from stack outputs..."
 ECR_REPO_URI=$(aws cloudformation describe-stacks \
   --stack-name "orderflow-ecr-$ENV" \
   --profile "$PROFILE" \
@@ -389,11 +401,19 @@ ECR_REPO_URI=$(aws cloudformation describe-stacks \
   --query "Stacks[0].Outputs[?OutputKey=='OrderServiceRepoUri'].OutputValue" \
   --output text)
 
-if [ -z "$ECR_REPO_URI" ]; then
-  fail "Could not read OrderServiceRepoUri from orderflow-ecr-$ENV stack outputs"
+INVENTORY_REPO_URI=$(aws cloudformation describe-stacks \
+  --stack-name "orderflow-ecr-$ENV" \
+  --profile "$PROFILE" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='InventoryServiceRepoUri'].OutputValue" \
+  --output text)
+
+if [ -z "$ECR_REPO_URI" ] || [ -z "$INVENTORY_REPO_URI" ]; then
+  fail "Could not read repo URIs from orderflow-ecr-$ENV stack outputs"
   exit 1
 fi
-ok "ECR repo URI: $ECR_REPO_URI"
+ok "order-service repo    : $ECR_REPO_URI"
+ok "inventory-service repo: $INVENTORY_REPO_URI"
 
 next_step "ECS cluster"
 
@@ -407,37 +427,22 @@ next_step "ECS cluster"
 section "STEP 11 — ECS cluster"
 deploy_stack "orderflow-ecs-cluster-$ENV" "infra/compute/ecs-cluster.yaml"
 
-next_step "Build order-service Docker image and push to ECR"
+next_step "Build service Docker images and push to ECR"
 
-# ── STEP 12: BUILD + PUSH ORDER SERVICE IMAGE ─────────────────────────────────
-# We must push the image BEFORE deploying ecs-service.yaml because the task
-# definition references the image URI. If the image doesn't exist in ECR,
-# the ECS service will fail to launch tasks.
+# ── STEP 12: BUILD + PUSH SERVICE IMAGES ──────────────────────────────────────
+# Images must be in ECR BEFORE the ECS service stacks deploy, because each
+# task definition references an image URI. If the image isn't there, ECS
+# fails to launch tasks and the stack rolls back.
 #
 # The Dockerfile is a multi-stage build:
 #   Stage 1 (build): eclipse-temurin:21-jdk-alpine — compiles the JAR
-#   Stage 2 (runtime): eclipse-temurin:21-jre-alpine — lean runtime image
-# Non-root user "app" is created — best practice for container security.
+#   Stage 2 (jlink): strips the JRE to only the modules the app uses
+#   Stage 3 (runtime): alpine + custom JRE + the JAR, non-root user
 
-section "STEP 12 — Build order-service Docker image"
+section "STEP 12 — Build and push service Docker images"
 
-ORDER_SERVICE_DIR="$PROJECT_ROOT/services/order-service"
-info "Building Docker image from $ORDER_SERVICE_DIR ..."
-info "This compiles the Spring Boot JAR inside the container — takes ~2-3 minutes on first run"
-
-cd "$ORDER_SERVICE_DIR"
-
-# Build the image locally and tag it with the ECR URI so docker push knows where to send it
-docker build \
-  --tag "$ECR_REPO_URI:$IMAGE_TAG" \
-  --tag "$ECR_REPO_URI:$(date +%Y%m%d%H%M%S)" \
-  .
-
-ok "Docker image built: $ECR_REPO_URI:$IMAGE_TAG"
-
-# Authenticate Docker to ECR.
-# ECR uses short-lived tokens (valid 12 hours). This command fetches a fresh
-# token and pipes it into docker login automatically.
+# Authenticate Docker to ECR once for both pushes.
+# ECR uses short-lived tokens (valid 12 hours). This fetches a fresh one.
 info "Authenticating Docker with ECR..."
 aws ecr get-login-password \
   --region "$REGION" \
@@ -448,13 +453,33 @@ aws ecr get-login-password \
       "$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
 ok "Docker authenticated with ECR"
 
-# Push the image
-info "Pushing image to ECR (this uploads the layers — may take a minute)..."
-docker push "$ECR_REPO_URI:$IMAGE_TAG"
-ok "Image pushed to ECR: $ECR_REPO_URI:$IMAGE_TAG"
+# Usage: build_and_push_image <service-dir-name> <ecr-repo-uri>
+build_and_push_image() {
+  local SERVICE=$1
+  local REPO_URI=$2
 
-cd "$PROJECT_ROOT"
-next_step "Deploy ECS service (ALB + task definition + service with 2 tasks)"
+  info "Building $SERVICE image (compiles the JAR inside the container — ~2-3 min first run)..."
+  cd "$PROJECT_ROOT/services/$SERVICE"
+
+  # Two tags: :latest for the task definition to reference, and a timestamp
+  # tag so ECR keeps an identifiable history of what was deployed when.
+  docker build \
+    --tag "$REPO_URI:$IMAGE_TAG" \
+    --tag "$REPO_URI:$(date +%Y%m%d%H%M%S)" \
+    .
+  ok "$SERVICE image built"
+
+  info "Pushing $SERVICE to ECR..."
+  docker push "$REPO_URI:$IMAGE_TAG"
+  ok "$SERVICE pushed: $REPO_URI:$IMAGE_TAG"
+
+  cd "$PROJECT_ROOT"
+}
+
+build_and_push_image "order-service"     "$ECR_REPO_URI"
+build_and_push_image "inventory-service" "$INVENTORY_REPO_URI"
+
+next_step "Deploy ECS service (ALB + task definition + service)"
 
 # ── STEP 13: ECS SERVICE ─────────────────────────────────────────────────────
 # This is the biggest stack — creates several resources at once:
@@ -496,11 +521,59 @@ section "STEP 14 — API Gateway + Lambda authorizer"
 deploy_stack "orderflow-api-$ENV" "infra/api/api-gateway.yaml" \
   "JwtSecret=$JWT_SECRET"
 
+next_step "Phase 2 — inventory-service behind an internal ALB"
+
+# ══ PHASE 2 STACKS ═══════════════════════════════════════════════════════════
+# Everything above delivers "order lands in SQS". The three stacks below are
+# what finally consume that message and drive the order to PAID.
+
+# ── STEP 15: INVENTORY SERVICE ───────────────────────────────────────────────
+# ECS Fargate service behind an INTERNAL ALB (private IPs only — unreachable
+# from the internet by routing, not just by security group).
+# On first boot Flyway creates the `inventory` schema, its own
+# flyway_schema_history, the stock/stock_reservations tables, and seeds a
+# handful of products so the flow is testable immediately.
+# Must deploy BEFORE the order-processor Lambda, which imports this stack's
+# ALB DNS name as an environment variable.
+
+section "STEP 15 — inventory-service (internal ALB + Fargate task)"
+info "Waiting for the task to pass health checks — expect 3-5 minutes..."
+deploy_stack "orderflow-inventory-service-$ENV" "infra/compute/inventory-service.yaml" \
+  "DBMasterPassword=$DB_MASTER_PASSWORD" \
+  "ImageTag=$IMAGE_TAG"
+
+next_step "order-processor Lambda (the SQS consumer)"
+
+# ── STEP 16: ORDER PROCESSOR LAMBDA ──────────────────────────────────────────
+# The piece that was missing at the end of Phase 1: something that actually
+# drains the order queue. VPC-attached so it can reach the internal ALB.
+# Creates the function plus the SQS event source mapping (BatchSize 10,
+# ReportBatchItemFailures so one poison message doesn't retry its 9 healthy
+# neighbours).
+
+section "STEP 16 — order-processor Lambda + SQS trigger"
+deploy_stack "orderflow-order-processor-$ENV" "infra/compute/lambda-order-processor.yaml"
+
+next_step "payment Lambda (EventBridge target)"
+
+# ── STEP 17: PAYMENT LAMBDA ──────────────────────────────────────────────────
+# Triggered by the OrderConfirmed rule on the custom bus. Connects to Aurora
+# directly over JDBC and flips the order to PAID / PAYMENT_FAILED with a
+# conditional UPDATE (".. AND status = 'PENDING'"), which is what makes a
+# duplicate EventBridge delivery harmless.
+# PaymentDeclineAbove makes the failure path reproducible: any order totalling
+# more than this is declined on purpose.
+
+section "STEP 17 — payment Lambda (EventBridge target)"
+deploy_stack "orderflow-payment-$ENV" "infra/compute/lambda-payment.yaml" \
+  "DBMasterPassword=$DB_MASTER_PASSWORD" \
+  "PaymentDeclineAbove=10000"
+
 next_step "Fetch API URL and print test commands"
 
-# ── STEP 15: PRINT SUMMARY + TEST COMMANDS ───────────────────────────────────
+# ── STEP 18: PRINT SUMMARY + TEST COMMANDS ───────────────────────────────────
 
-section "STEP 15 — Deployment complete! Summary + test commands"
+section "STEP 18 — Deployment complete! Summary + test commands"
 
 # Fetch the API invoke URL from the stack output
 API_URL=$(aws cloudformation describe-stacks \
@@ -524,7 +597,10 @@ for STACK in \
   "orderflow-ecr-$ENV" \
   "orderflow-ecs-cluster-$ENV" \
   "orderflow-ecs-service-$ENV" \
-  "orderflow-api-$ENV"
+  "orderflow-api-$ENV" \
+  "orderflow-inventory-service-$ENV" \
+  "orderflow-order-processor-$ENV" \
+  "orderflow-payment-$ENV"
 do
   STATUS=$(aws cloudformation describe-stacks \
     --stack-name "$STACK" \
@@ -558,7 +634,10 @@ echo "       -H \"Content-Type: application/json\" \\"
 echo "       -d '{\"userId\":\"user-123\",\"items\":[{\"productId\":\"prod-001\",\"quantity\":2,\"unitPrice\":49.99}]}' \\"
 echo "       | jq ."
 echo ""
-echo "  3. Get the order back (replace ORDER_ID with the id from step 2):"
+echo "  3. Wait ~5 seconds, then read it back — status should now be PAID,"
+echo "     NOT the PENDING it was created as. That flip is the whole of"
+echo "     Phase 2 working: SQS -> order-processor -> inventory-service"
+echo "     -> EventBridge -> payment Lambda -> RDS."
 echo ""
 echo "     curl -s \$API_URL/orders/ORDER_ID \\"
 echo "       -H \"Authorization: Bearer \$TOKEN\" | jq ."
@@ -567,14 +646,32 @@ echo "  4. Test auth rejection (expect 401):"
 echo ""
 echo "     curl -s -o /dev/null -w \"%{http_code}\" \$API_URL/orders/some-id"
 echo ""
+echo "  5. Exercise the PAYMENT_FAILED path — any order over 10000 total is"
+echo "     declined on purpose (PaymentDeclineAbove), so status becomes"
+echo "     PAYMENT_FAILED instead of PAID:"
+echo ""
+echo "       -d '{\"userId\":\"user-123\",\"items\":[{\"productId\":\"prod-001\",\"quantity\":1,\"unitPrice\":25000}]}'"
+echo ""
+echo "  6. Exercise the OUT-OF-STOCK path — 'prod-003' is seeded with only 25"
+echo "     units, so ordering more than that leaves the order PENDING and"
+echo "     publishes OrderFailed (no payment is ever attempted):"
+echo ""
+echo "       -d '{\"userId\":\"user-123\",\"items\":[{\"productId\":\"prod-003\",\"quantity\":999,\"unitPrice\":5}]}'"
+echo ""
 echo -e "${BOLD}  ─── WHAT TO CHECK IN AWS CONSOLE ──────────────────────────${NC}"
 echo ""
-echo "    CloudFormation → all 11 stacks = CREATE_COMPLETE"
-echo "    EC2 → Load Balancers → Target Group → 2 targets HEALTHY"
-echo "    ECS → orderflow-cluster-dev → service → Running count = 2"
+echo "    CloudFormation → all 14 stacks = CREATE_COMPLETE"
+echo "    ECS → orderflow-cluster-$ENV → 2 services, both Running"
 echo "    RDS → cluster status = available"
+echo "    SQS → order-queue depth returns to 0 (the consumer drains it now)"
 echo "    SQS → order-dlq message count = 0 (no failures)"
-echo "    Lambda → orderflow-authorizer-dev → State = Active"
+echo "    Lambda → orderflow-order-processor-$ENV → invocations > 0"
+echo "    Lambda → orderflow-payment-$ENV → invocations > 0"
 echo ""
-echo -e "${GREEN}${BOLD}  ✅  OrderFlow Phase 1 deployed to $ENV ($REGION)${NC}"
+echo -e "${BOLD}  Useful logs:${NC}"
+echo "    aws logs tail /aws/lambda/orderflow-order-processor-$ENV --since 10m --follow"
+echo "    aws logs tail /aws/lambda/orderflow-payment-$ENV --since 10m --follow"
+echo "    aws logs tail /ecs/orderflow-inventory-service-$ENV --since 10m --follow"
+echo ""
+echo -e "${GREEN}${BOLD}  ✅  OrderFlow Phase 1 + 2 deployed to $ENV ($REGION)${NC}"
 echo ""

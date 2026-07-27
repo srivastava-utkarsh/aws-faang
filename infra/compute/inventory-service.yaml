@@ -1,0 +1,155 @@
+# infra/compute/inventory-service.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OrderFlow inventory-service on ECS Fargate behind an INTERNAL ALB.
+  Unlike order-service, nothing outside the VPC can reach this — the only
+  caller is the order-processor Lambda.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ImageTag:
+    Type: String
+    Default: latest
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+
+Resources:
+
+  # ── INTERNAL LOAD BALANCER ─────────────────────────────────────────────────
+  # Scheme: internal is the key difference from order-service's ALB. It gets
+  # private IPs only, has no public DNS record, and lives in the PRIVATE
+  # subnets. Even with a permissive security group, there is no route from
+  # the internet to it.
+  InternalAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub orderflow-inv-alb-${Environment}
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !ImportValue
+            Fn::Sub: orderflow-InventoryAlbSG-${Environment}
+      Subnets:
+        - !ImportValue
+            Fn::Sub: orderflow-PrivateSubnetA-${Environment}
+        - !ImportValue
+            Fn::Sub: orderflow-PrivateSubnetB-${Environment}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub orderflow-inv-tg-${Environment}
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: orderflow-VpcId-${Environment}
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── TASK DEFINITION ────────────────────────────────────────────────────────
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub orderflow-inventory-service-${Environment}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      # Same ARM64 choice as order-service: the image is built by plain
+      # `docker build` on the deploying machine (Apple Silicon here), and
+      # Graviton Fargate is cheaper than X86_64 anyway.
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      # Execution role is shared with order-service — its job (pull image,
+      # write logs) is identical for every task in this account. The TASK
+      # role is the one that must differ per service, and it does.
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: orderflow-EcsExecutionRoleArn-${Environment}
+      TaskRoleArn: !ImportValue
+        Fn::Sub: orderflow-InventoryTaskRoleArn-${Environment}
+      ContainerDefinitions:
+        - Name: inventory-service
+          Image: !Sub
+            - '${RepoUri}:${ImageTag}'
+            - RepoUri:
+                Fn::ImportValue: !Sub orderflow-InventoryServiceRepoUri-${Environment}
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_URL
+              Value: !Sub
+                - jdbc:postgresql://${Endpoint}:${Port}/orderflow
+                - Endpoint:
+                    Fn::ImportValue: !Sub orderflow-DBEndpoint-${Environment}
+                  Port:
+                    Fn::ImportValue: !Sub orderflow-DBPort-${Environment}
+            - Name: DB_USERNAME
+              Value: orderflow_admin
+            - Name: DB_PASSWORD
+              Value: !Ref DBMasterPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: inventory-service
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/orderflow-inventory-service-${Environment}
+      RetentionInDays: 14
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub orderflow-inventory-service-${Environment}
+      Cluster: !ImportValue
+        Fn::Sub: orderflow-ClusterName-${Environment}
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+                Fn::Sub: orderflow-PrivateSubnetA-${Environment}
+            - !ImportValue
+                Fn::Sub: orderflow-PrivateSubnetB-${Environment}
+          SecurityGroups:
+            - !ImportValue
+                Fn::Sub: orderflow-InventorySG-${Environment}
+      LoadBalancers:
+        - ContainerName: inventory-service
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  InventoryAlbDnsName:
+    Description: Private DNS of the internal ALB — injected into the order-processor Lambda
+    Value: !GetAtt InternalAlb.DNSName
+    Export:
+      Name: !Sub orderflow-InventoryAlbDnsName-${Environment}

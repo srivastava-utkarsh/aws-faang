@@ -13,52 +13,43 @@
   </parent>
 
   <groupId>com.orderflow</groupId>
-  <artifactId>order-service</artifactId>
+  <artifactId>inventory-service</artifactId>
   <version>1.0.0</version>
   <packaging>jar</packaging>
 
   <properties>
     <java.version>21</java.version>
-    <aws.sdk.version>2.25.0</aws.sdk.version>
   </properties>
 
+  <!--
+    Deliberately smaller dependency set than order-service: this service
+    talks to nothing but its own database. No SQS, no DynamoDB, no
+    EventBridge SDK — the order-processor Lambda owns all the messaging
+    and calls this service over plain HTTP.
+  -->
   <dependencies>
 
-    <!-- Web: exposes REST endpoints -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
 
-    <!-- JPA: talks to RDS Aurora PostgreSQL -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-data-jpa</artifactId>
     </dependency>
 
-    <!-- Validation: @Valid on request DTOs -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
 
-    <!-- Actuator: /actuator/health for ALB health checks -->
+    <!-- /actuator/health — the internal ALB's health check target -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
-    <!-- Flyway: manages DB schema migrations.
-         Replaces ddl-auto — safe for production.
-         spring-boot-flyway is the autoconfiguration that actually RUNS
-         Flyway on startup — Spring Boot 4 split autoconfigure into
-         per-technology jars (spring-boot-jdbc, -sql, -hibernate, -jpa,
-         -data-jpa are all separate now too), so flyway-core alone puts
-         Flyway's classes on the classpath but nothing invokes them. -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-flyway</artifactId>
-    </dependency>
     <dependency>
       <groupId>org.flywaydb</groupId>
       <artifactId>flyway-core</artifactId>
@@ -68,59 +59,18 @@
       <artifactId>flyway-database-postgresql</artifactId>
     </dependency>
 
-    <!-- PostgreSQL JDBC driver -->
     <dependency>
       <groupId>org.postgresql</groupId>
       <artifactId>postgresql</artifactId>
       <scope>runtime</scope>
     </dependency>
 
-    <!-- Classic Jackson 2.x ObjectMapper, used directly by OrderQueuePublisher.
-         Spring Boot 4's own JacksonAutoConfiguration only wires up Jackson 3's
-         tools.jackson.databind.ObjectMapper now, so this can't be a Spring bean —
-         declared explicitly here instead of relying on AWS SDK's transitive pull
-         of the same classic Jackson 2.x for its own internal marshalling. -->
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-databind</artifactId>
-    </dependency>
-
-    <!-- AWS SDK v2: SQS client for publishing order messages -->
-    <dependency>
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>sqs</artifactId>
-      <version>${aws.sdk.version}</version>
-    </dependency>
-
-    <!-- AWS SDK v2: DynamoDB client for idempotency checks -->
-    <dependency>
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>dynamodb</artifactId>
-      <version>${aws.sdk.version}</version>
-    </dependency>
-
-    <!-- AWS SDK v2: EventBridge client for publishing domain events -->
-    <dependency>
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>eventbridge</artifactId>
-      <version>${aws.sdk.version}</version>
-    </dependency>
-
-    <!-- Structured JSON logging for CloudWatch Insights queries -->
-    <dependency>
-      <groupId>net.logstash.logback</groupId>
-      <artifactId>logstash-logback-encoder</artifactId>
-      <version>7.4</version>
-    </dependency>
-
-    <!-- Lombok: eliminates boilerplate (getters, builders, etc.) -->
     <dependency>
       <groupId>org.projectlombok</groupId>
       <artifactId>lombok</artifactId>
       <optional>true</optional>
     </dependency>
 
-    <!-- Test -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>
@@ -134,9 +84,9 @@
       <!--
         Lombok must be declared as an explicit annotation processor path.
         JDK 23+ no longer runs annotation processors found on the classpath
-        implicitly, so relying on the <dependency> alone works inside the
-        Dockerfile (JDK 21) but fails a local `mvn compile` on a newer JDK
-        with confusing "cannot find symbol: getId()" errors.
+        implicitly, so relying on the plain <dependency> above works on a
+        JDK 21 build (e.g. inside the Dockerfile) but silently produces
+        "cannot find symbol: getFoo()" on a newer local JDK.
       -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

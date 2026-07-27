@@ -73,6 +73,13 @@ fi
 
 # Exact reverse of deploy.sh's stack order.
 STACKS=(
+  # Phase 2 first — these are the newest and depend on everything below.
+  # The two Lambdas must go before the VPC (they hold ENIs in its subnets)
+  # and before inventory-service (whose ALB DNS the processor imports).
+  "orderflow-payment-$ENV"
+  "orderflow-order-processor-$ENV"
+  "orderflow-inventory-service-$ENV"
+  # Phase 1
   "orderflow-api-$ENV"
   "orderflow-ecs-service-$ENV"
   "orderflow-ecs-cluster-$ENV"
